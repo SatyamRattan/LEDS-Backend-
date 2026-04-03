@@ -1,0 +1,18 @@
+# Python Environment
+venv/
+__pycache__/
+*.pyc
+
+# Local Config & Secrets
+.env
+db.sqlite3
+
+# Personal Data / Images
+*.jpeg
+*.jpg
+*_base64.txt
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
