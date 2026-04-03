@@ -1,5 +1,7 @@
 from django.db import models
 import random
+from django.utils import timezone
+from datetime import timedelta
 
 class IdentityRegistry(models.Model):
     """
@@ -38,6 +40,7 @@ class LoanApplication(models.Model):
         ('APPROVED', 'Approved'),
         ('REJECTED', 'Rejected'),
         ('REVIEW', 'Manual Review'),
+        ('DISBURSED', 'Disbursed'),
     ]
 
     applicant = models.ForeignKey(Applicant, on_delete=models.CASCADE, related_name='loans')
@@ -54,6 +57,21 @@ class LoanApplication(models.Model):
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    disbursed_at = models.DateTimeField(null=True, blank=True)
+    transaction_id = models.CharField(max_length=100, null=True, blank=True)
 
     def __str__(self):
         return f"Loan {self.id} - {self.applicant.full_name} ({self.status})"
+
+class OTPVerification(models.Model):
+    phone = models.CharField(max_length=15)
+    otp = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_verified = models.BooleanField(default=False)
+
+    def is_expired(self):
+        # OTP valid for 5 minutes
+        return timezone.now() > self.created_at + timedelta(minutes=5)
+
+    def __str__(self):
+        return f"OTP for {self.phone}: {self.otp} ({'Verified' if self.is_verified else 'Pending'})"
