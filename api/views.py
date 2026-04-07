@@ -1,11 +1,21 @@
 import random
+import re
+import cv2
+import numpy as np
+import easyocr
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from .models import Applicant, LoanApplication, IdentityRegistry, OTPVerification
 from .services import IdentityService, CreditService, ContractService, DisbursementService, NotificationService
-from django.db.models import Count, Sum
+from django.db.models import Count, Sum, Q
+from django.db import models
+from datetime import datetime
+
+# Initialize EasyOCR reader (English)
+# GPU=False for CPU compatibility in development
+reader = easyocr.Reader(['en'], gpu=False)
 
 class VerifyPanView(APIView):
     """
@@ -121,11 +131,15 @@ class LoanApplicationView(APIView):
         pan = applicant_info.get('pan')
         
         # 1. Fetch live Credit Score from Bureau Simulator
-        cibil = CreditService.get_cibil_score(pan)
+        cibil = CreditService.get_cibil_score(pan or "UNKNOWN")
         
         # 2. Get Income from Identity Registry
-        registry_user = IdentityRegistry.objects.get(pan=pan)
-        monthly_income = float(registry_user.monthly_income)
+        try:
+            registry_user = IdentityRegistry.objects.get(pan=pan.upper() if pan else "UNKNOWN")
+            monthly_income = float(registry_user.monthly_income)
+        except IdentityRegistry.DoesNotExist:
+            # Fallback to declared income if not in registry (for new OCR users)
+            monthly_income = float(data.get('income', {}).get('monthly_salary', 30000))
         
         # 3. Decision Logic (Dynamic)
         credit_status, interest_rate = CreditService.evaluate_loan(
@@ -134,16 +148,26 @@ class LoanApplicationView(APIView):
             cibil=cibil
         )
         
-        # 4. Persistence
+        # 4. Handle DOB Format (OCR returns DD/MM/YYYY, DB needs YYYY-MM-DD)
+        dob = applicant_info.get('dob')
+        if dob and "/" in dob:
+            try:
+                # Convert DD/MM/YYYY to YYYY-MM-DD
+                d, m, y = dob.split("/")
+                dob = f"{y}-{m}-{d}"
+            except:
+                pass # Keep as is if parsing fails
+        
+        # 5. Persistence
         applicant, _ = Applicant.objects.update_or_create(
             pan=pan,
             defaults={
                 'aadhaar': applicant_info.get('aadhaar'),
                 'full_name': applicant_info.get('full_name'),
-                'dob': applicant_info.get('dob'),
-                'phone': applicant_info.get('phone'),
-                'address': applicant_info.get('address'),
-                'pincode': applicant_info.get('pincode'),
+                'dob': dob or '1990-01-01',
+                'phone': applicant_info.get('phone', '9876543210'),
+                'address': applicant_info.get('address', 'Extracted Address'),
+                'pincode': applicant_info.get('pincode', '000000'),
             }
         )
         
@@ -181,12 +205,12 @@ class AdminStatsView(APIView):
     def get(self, request):
         from django.db.models.functions import Coalesce
         stats = LoanApplication.objects.aggregate(
-            total_disbursed=Coalesce(Sum('amount', filter=models.Q(status='DISBURSED')), 0, output_field=models.DecimalField()),
-            count_approved=Count('id', filter=models.Q(status='APPROVED')),
-            count_disbursed=Count('id', filter=models.Q(status='DISBURSED')),
-            count_rejected=Count('id', filter=models.Q(status='REJECTED')),
-            count_review=Count('id', filter=models.Q(status='REVIEW')),
-            count_pending=Count('id', filter=models.Q(status='PENDING')),
+            total_disbursed=Coalesce(Sum('amount', filter=Q(status='DISBURSED')), 0, output_field=models.DecimalField()),
+            count_approved=Count('id', filter=Q(status='APPROVED')),
+            count_disbursed=Count('id', filter=Q(status='DISBURSED')),
+            count_rejected=Count('id', filter=Q(status='REJECTED')),
+            count_review=Count('id', filter=Q(status='REVIEW')),
+            count_pending=Count('id', filter=Q(status='PENDING')),
         )
         
         # Latest 5 applications
@@ -256,31 +280,162 @@ class DocumentOCRView(APIView):
         if not file_obj:
             return Response({"error": "No file uploaded"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # SATYAM RATTAN (Real Test Case):
-        # We fetch the specific record added for Satyam to ensure the 
-        # simulation works perfectly with their uploaded documents.
-        registry_user = IdentityRegistry.objects.filter(pan='HEOPR7916R').first()
-        
-        # Fallback to first user if Satyam's record is missing
-        if not registry_user:
-            registry_user = IdentityRegistry.objects.first()
-
-        if doc_type == 'pan':
-            mock_data = {
-                "pan": "HEOPR7916R",
-                "full_name": "SATYAM RATTAN",
-                "dob": "2004-08-25",
-                "message": "Real PAN data extracted via Simulated OCR ✅"
-            }
-        else:
-            mock_data = {
-                "aadhaar": "552086769998",
-                "address": "House No-77, Panchsheel Enclave, Zirakpur, SAS Nagar (Mohali), Punjab",
-                "pincode": "140603",
-                "message": "Real Aadhaar data extracted via Simulated OCR ✅"
-            }
+        try:
+            # 1. Read document into OpenCV
+            file_bytes = np.frombuffer(file_obj.read(), np.uint8)
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
             
-        return Response(mock_data, status=status.HTTP_200_OK)
+            if img is None:
+                return Response({"error": "Invalid image file"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 2. PRE-PROCESSING: Resize and Rotate for better OCR accuracy
+            # Resize to standard width for consistent performance
+            height, width = img.shape[:2]
+            scale = 1000 / width
+            resized_img = cv2.resize(img, (1000, int(height * scale)))
+            gray = cv2.cvtColor(resized_img, cv2.COLOR_BGR2GRAY)
+
+            # 3. Perform OCR with Multi-Rotation
+            # We try 0deg and then 90deg increments to find the text
+            raw_text = ""
+            text_blobs = []
+            
+            # Rotations to try: 0, 90 (CW), 90 (CCW)
+            angles = [None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]
+            
+            for angle in angles:
+                work_img = gray if angle is None else cv2.rotate(gray, angle)
+                results = reader.readtext(work_img, detail=0)
+                temp_text = " ".join(results).upper()
+                
+                # Check for ID patterns in this rotation
+                if re.search(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', temp_text) or re.search(r'[0-9]{4}\s?[0-9]{4}\s?[0-9]{4}', temp_text):
+                    raw_text = temp_text
+                    text_blobs = results
+                    print(f"[OCR] Rotation {angle} SUCCESS")
+                    break
+                else:
+                    raw_text += " " + temp_text # Collect all just in case
+                    text_blobs.extend(results)
+
+            print(f"\n[REAL OCR EXTRACTED TEXT]: {raw_text}\n")
+
+            # 4. Intelligent Extraction
+            extracted_data = {}
+            if doc_type == 'pan':
+                # RegEx for PAN: Standard 10-character AlphaNumeric
+                pan_match = re.search(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', raw_text)
+                pan_val = pan_match.group(0) if pan_match else "UNKNOWN"
+                
+                # Heuristic for Name: Take first line below "NAME" or 
+                # first sequence of 2+ words in upper case
+                name_val = self._extract_field(text_blobs, "NAME")
+                if not name_val:
+                    # Look for first 2-3 uppercase words sequence (Typical for PAN Card)
+                    name_match = re.search(r'[A-Z]{3,}\s[A-Z]{3,}(\s[A-Z]{3,})?', raw_text)
+                    name_val = name_match.group(0) if name_match else "EXTRACTED USER"
+
+                # RegEx for DOB: DD/MM/YYYY
+                dob_match = re.search(r'[0-9]{2}/[0-9]{2}/[0-9]{4}', raw_text)
+                dob_val = dob_match.group(0) if dob_match else "1995-01-01"
+
+                # Convert DD/MM/YYYY to YYYY-MM-DD for Django models if needed
+                if "/" in dob_val:
+                    d, m, y = dob_val.split("/")
+                    dob_db_format = f"{y}-{m}-{d}"
+                else:
+                    dob_db_format = "1995-01-01"
+
+                extracted_data = {
+                    "pan": pan_val,
+                    "full_name": name_val,
+                    "dob": dob_val, # For UI
+                    "dob_db": dob_db_format, # For registry
+                    "message": f"Real-time PAN {pan_val} extracted via Multi-Angle AI ✅"
+                }
+
+            else:
+                # RegEx for Aadhaar: 12 digits (with potential spaces)
+                aadhaar_match = re.search(r'[0-9]{4}\s?[0-9]{4}\s?[0-9]{4}', raw_text)
+                aadhaar_val = aadhaar_match.group(0).replace(" ", "") if aadhaar_match else "UNKNOWN"
+                
+                # RegEx for Pincode
+                pin_match = re.search(r'[0-9]{6}', raw_text)
+                pin_val = pin_match.group(0) if pin_match else "000000"
+
+                # Heuristic for Address: Look for S/O, D/O, W/O or Address keywords
+                address_val = self._extract_address(text_blobs, pin_val)
+
+                extracted_data = {
+                    "aadhaar": aadhaar_val,
+                    "address": address_val,
+                    "pincode": pin_val,
+                    "message": f"Real-time Aadhaar {aadhaar_val} extracted via AI ✅"
+                }
+
+            # 5. AUTO-SYNC WITH IDENTITY REGISTRY
+            if extracted_data.get('pan') and extracted_data['pan'] != "UNKNOWN":
+                # We update/create by PAN. Aadhaar might be null initially.
+                # Since we made Aadhaar optional in the model, this works.
+                IdentityRegistry.objects.update_or_create(
+                    pan=extracted_data['pan'],
+                    defaults={
+                        "full_name": extracted_data.get('full_name', 'EXTRACTED USER'),
+                        "dob": extracted_data.get('dob_db', '1990-01-01'),
+                        "phone": "9876543210",
+                        "credit_score": 750
+                    }
+                )
+            elif extracted_data.get('aadhaar') and extracted_data['aadhaar'] != "UNKNOWN":
+                # If we only have Aadhaar, we skip the registry update for now 
+                # as PAN is the mandatory primary key for our simulation.
+                pass
+
+            return Response(extracted_data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            print(f"OCR ENGINE ERROR: {str(e)}")
+            return Response({"error": f"OCR Engine Failure: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _extract_field(self, blobs, keyword):
+        """Helper to find text relative to a keyword"""
+        for i, blob in enumerate(blobs):
+            if keyword in blob.upper():
+                if i + 1 < len(blobs):
+                    return blobs[i+1].upper()
+        return None
+
+    def _extract_address(self, blobs, pincode):
+        """Heuristic for Indian Aadhaar Address extraction"""
+        # Added SIO/S.O. as common OCR misinterpretations of S/O
+        keywords = ["S/O", "SIO", "D/O", "W/O", "ADDRESS", "C/O", "S.O.", "SON OF"]
+        start_idx = -1
+        
+        # Clean blobs to remove single character noise
+        clean_blobs = [b for b in blobs if len(b) > 2]
+
+        for i, blob in enumerate(clean_blobs):
+            upper_blob = blob.upper()
+            if any(k in upper_blob for k in keywords):
+                start_idx = i
+                break
+        
+        if start_idx != -1:
+            addr_parts = []
+            # We skip the very first blob (which contains S/O: Name) to keep the address clean
+            # as requested by the user.
+            for j in range(start_idx + 1, min(start_idx + 8, len(clean_blobs))):
+                blob = clean_blobs[j]
+                if pincode in blob:
+                    # Capture the text BEFORE the pincode if any
+                    last_part = blob.split(pincode)[0].strip(", ")
+                    if last_part: addr_parts.append(last_part)
+                    break
+                addr_parts.append(blob)
+            
+            return ", ".join(addr_parts)
+            
+        return "Address Found in Scan"
 
 class SendOTPView(APIView):
     """
