@@ -17,6 +17,22 @@ from datetime import datetime
 # GPU=False for CPU compatibility in development
 reader = easyocr.Reader(['en'], gpu=False)
 
+def safe_float(value, default=0.0):
+    try:
+        if value is None or value == '':
+            return default
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+def safe_int(value, default=0):
+    try:
+        if value is None or value == '':
+            return default
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
 class VerifyPanView(APIView):
     """
     Simulates calling an External Identity Registry (DPI simulation).
@@ -76,8 +92,8 @@ class CheckCibilView(APIView):
         try:
             print(f"DEBUG: Receiving CIBIL request: {request.data}")
             pan = request.data.get('pan', '').upper()
-            loan_amount = float(request.data.get('loan_amount', 0) or 0)
-            monthly_income = float(request.data.get('monthly_income', 0) or 0)
+            loan_amount = safe_float(request.data.get('loan_amount', 0))
+            monthly_income = safe_float(request.data.get('monthly_income', 0))
 
             if not pan:
                 return Response({"error": "PAN is required"}, status=status.HTTP_400_BAD_REQUEST)
@@ -123,80 +139,93 @@ class LoanApplicationView(APIView):
     Dynamic Credit Decision and Application Submission.
     """
     def post(self, request):
-        data = request.data
-        applicant_info = data.get('applicant', {})
-        loan_info = data.get('loan', {})
-        bank_info = data.get('bank', {})
-        
-        pan = applicant_info.get('pan')
-        
-        # 1. Fetch live Credit Score from Bureau Simulator
-        cibil = CreditService.get_cibil_score(pan or "UNKNOWN")
-        
-        # 2. Get Income from Identity Registry
         try:
-            registry_user = IdentityRegistry.objects.get(pan=pan.upper() if pan else "UNKNOWN")
-            monthly_income = float(registry_user.monthly_income)
-        except IdentityRegistry.DoesNotExist:
-            # Fallback to declared income if not in registry (for new OCR users)
-            monthly_income = float(data.get('income', {}).get('monthly_salary', 30000))
-        
-        # 3. Decision Logic (Dynamic)
-        credit_status, interest_rate = CreditService.evaluate_loan(
-            amount=float(loan_info.get('amount', 0)),
-            monthly_income=monthly_income,
-            cibil=cibil
-        )
-        
-        # 4. Handle DOB Format (OCR returns DD/MM/YYYY, DB needs YYYY-MM-DD)
-        dob = applicant_info.get('dob')
-        if dob and "/" in dob:
+            data = request.data
+            applicant_info = data.get('applicant', {})
+            loan_info = data.get('loan', {})
+            bank_info = data.get('bank', {})
+            income_info = data.get('income', {})
+            
+            pan = applicant_info.get('pan')
+            if not pan:
+                return Response({"error": "PAN is mandatory for loan application"}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # 1. Fetch live Credit Score from Bureau Simulator
+            cibil = CreditService.get_cibil_score(pan)
+            
+            # 2. Get Income from Identity Registry or Fallback
             try:
-                # Convert DD/MM/YYYY to YYYY-MM-DD
-                d, m, y = dob.split("/")
-                dob = f"{y}-{m}-{d}"
+                registry_user = IdentityRegistry.objects.get(pan=pan.upper())
+                monthly_income = float(registry_user.monthly_income)
+            except IdentityRegistry.DoesNotExist:
+                # Fallback to declared income if not in registry
+                monthly_income = safe_float(income_info.get('monthly_salary', 30000))
+            
+            # 3. Decision Logic (Dynamic)
+            credit_status, interest_rate = CreditService.evaluate_loan(
+                amount=safe_float(loan_info.get('amount', 0)),
+                monthly_income=monthly_income,
+                cibil=cibil
+            )
+            
+            # 4. Handle DOB Format (OCR returns DD/MM/YYYY, DB needs YYYY-MM-DD)
+            dob = applicant_info.get('dob')
+            if dob and "/" in dob:
+                try:
+                    d, m, y = dob.split("/")
+                    dob = f"{y}-{m}-{d}"
+                except:
+                    pass
+            
+            # 5. Persistence
+            applicant, _ = Applicant.objects.update_or_create(
+                pan=pan,
+                defaults={
+                    'aadhaar': applicant_info.get('aadhaar'),
+                    'full_name': applicant_info.get('full_name', 'Extracted User'),
+                    'dob': dob or '1990-01-01',
+                    'phone': applicant_info.get('phone', '9876543210'),
+                    'address': applicant_info.get('address', 'Extracted Address'),
+                    'pincode': applicant_info.get('pincode', '000000'),
+                }
+            )
+            
+            loan = LoanApplication.objects.create(
+                applicant=applicant,
+                amount=safe_float(loan_info.get('amount', 0)),
+                tenure=safe_int(loan_info.get('tenure', 12)),
+                purpose=loan_info.get('purpose', 'General Purpose'),
+                cibil_score=cibil,
+                status=credit_status,
+                interest_rate=interest_rate,
+                account_no=bank_info.get('account_no'),
+                ifsc=bank_info.get('ifsc')
+            )
+            
+            # Notification (Safe trigger)
+            try:
+                NotificationService.send_sms(applicant.phone, f"Application #LED{loan.id} received! Tracker: http://localhost:4200/track/{loan.id}")
             except:
-                pass # Keep as is if parsing fails
-        
-        # 5. Persistence
-        applicant, _ = Applicant.objects.update_or_create(
-            pan=pan,
-            defaults={
-                'aadhaar': applicant_info.get('aadhaar'),
-                'full_name': applicant_info.get('full_name'),
-                'dob': dob or '1990-01-01',
-                'phone': applicant_info.get('phone', '9876543210'),
-                'address': applicant_info.get('address', 'Extracted Address'),
-                'pincode': applicant_info.get('pincode', '000000'),
-            }
-        )
-        
-        loan = LoanApplication.objects.create(
-            applicant=applicant,
-            amount=loan_info.get('amount'),
-            tenure=loan_info.get('tenure'),
-            purpose=loan_info.get('purpose'),
-            cibil_score=cibil,
-            status=credit_status,
-            interest_rate=interest_rate,
-            account_no=bank_info.get('account_no'),
-            ifsc=bank_info.get('ifsc')
-        )
-        
-        # Notification
-        NotificationService.send_sms(applicant.phone, f"Application #LED{loan.id} received! Tracker: http://localhost:4200/track/{loan.id}")
-        
-        return Response({
-            "message": "Application processed via Dynamic Credit Engine",
-            "loan_id": loan.id,
-            "status": loan.status,
-            "cibil": loan.cibil_score,
-            "interest_rate": loan.interest_rate,
-            "amount": loan.amount,
-            "tenure": loan.tenure,
-            "account_no": loan.account_no,
-            "income_profile": "Standard" if monthly_income < 100000 else "Premium"
-        }, status=status.HTTP_201_CREATED)
+                pass
+            
+            return Response({
+                "message": "Application processed via Dynamic Credit Engine",
+                "loan_id": loan.id,
+                "status": loan.status,
+                "cibil": loan.cibil_score,
+                "interest_rate": loan.interest_rate,
+                "amount": loan.amount,
+                "tenure": loan.tenure,
+                "account_no": loan.account_no,
+                "income_profile": "Standard" if monthly_income < 100000 else "Premium"
+            }, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            print(f"CRITICAL ERROR in LoanApplicationView: {str(e)}")
+            return Response({
+                "error": "Internal Processing Error",
+                "detail": str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
 
 class AdminStatsView(APIView):
     """

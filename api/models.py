@@ -24,7 +24,7 @@ class IdentityRegistry(models.Model):
 
 class Applicant(models.Model):
     pan = models.CharField(max_length=10, unique=True)
-    aadhaar = models.CharField(max_length=12, unique=True)
+    aadhaar = models.CharField(max_length=12, unique=True, null=True, blank=True)
     full_name = models.CharField(max_length=255)
     dob = models.DateField()
     phone = models.CharField(max_length=15)
